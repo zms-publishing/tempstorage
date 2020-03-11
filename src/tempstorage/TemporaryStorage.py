@@ -20,357 +20,111 @@ This is a ripoff of Jim's Packless bsddb3 storage.
 """
 import bisect
 from logging import getLogger
-import warnings
 import time
 
 from ZODB import POSException
 from ZODB.BaseStorage import BaseStorage
-from ZODB.ConflictResolution import ConflictResolvingStorage
 from ZODB.serialize import referencesf
 from ZODB.utils import z64
-
-# keep old object revisions for CONFLICT_CACHE_MAXAGE seconds
-CONFLICT_CACHE_MAXAGE = 60
-
-# garbage collect conflict cache every CONFLICT_CACHE_GCEVERY seconds
-CONFLICT_CACHE_GCEVERY = 60
-
-# keep history of recently gc'ed oids of length RECENTLY_GC_OIDS_LEN
-RECENTLY_GC_OIDS_LEN = 200
 
 LOG = getLogger('TemporaryStorage')
 
 
-class ReferenceCountError(POSException.POSError):
-    """ Error while decrementing a reference to an object in the commit phase.
+class Transaction(object):
+    """Hold data for current transaction for MinimalMemoryStorage."""
 
-    The object's reference count was below zero.
-    """
+    def __init__(self, tid):
+        self.index = {}
+        self.tid = tid
 
+    def store(self, oid, data):
+        self.index[(oid, self.tid)] = data
 
-class TemporaryStorageError(POSException.POSError):
-    """ A Temporary Storage exception occurred.
+    def cur(self):
+        return dict.fromkeys([oid for oid, tid in self.index.keys()], self.tid)
 
-    This probably indicates that there is a low memory condition or a
-    tempfile space shortage.  Check available tempfile space and RAM
-    consumption and restart the server process.
-    """
-
-
-class TemporaryStorage(BaseStorage, ConflictResolvingStorage):
+class TemporaryStorage(BaseStorage, object):
 
     def __init__(self, name='TemporaryStorage'):
-        """
-        _index -- mapping, oid => current serial
-
-        _referenceCount -- mapping, oid => count
-
-        _oreferences -- mapping, oid => sequence of referenced oids
-
-        _opickle -- mapping, oid => pickle
-
-        _tmp -- used by 'store' to collect changes before finalization
-
-        _conflict_cache -- cache of recently-written object revisions
-
-        _last_cache_gc -- last time that conflict cache was garbage collected
-
-        _recently_gc_oids -- a queue of recently GC'ed oids
-
-        _oid -- ???
-
-        _ltid -- serial of last committed transaction (required by ZEO)
-
-        _conflict_cache_gcevery -- interval for doing GC on conflict cache
-
-        _conflict_cache_maxage -- age at whic conflict cache items are GC'ed
-        """
-        deprecation_warning = """\
-DEPRECATED: Usage of the package tempstorage is deprecated, as it is known to randomly lose data.
-Especially on Zope 4. For details see https://github.com/zopefoundation/tempstorage/issues/8
-and https://github.com/zopefoundation/tempstorage
-"""
-        LOG.warning(deprecation_warning)
-        warnings.warn(deprecation_warning, DeprecationWarning)
-
+        """ """
         BaseStorage.__init__(self, name)
-
+        # _index maps oid, tid pairs to data records
         self._index = {}
-        self._referenceCount = {}
-        self._oreferences = {}
-        self._opickle = {}
-        self._tmp = []
-        self._conflict_cache = {}
-        self._last_cache_gc = 0
-        self._recently_gc_oids = [None for x in range(RECENTLY_GC_OIDS_LEN)]
-        self._oid = z64
+        # _cur maps oid to current tid
+        self._cur = {}
+
         self._ltid = z64
 
-        # Alow overrides for testing.
-        self._conflict_cache_gcevery = CONFLICT_CACHE_GCEVERY
-        self._conflict_cache_maxage = CONFLICT_CACHE_MAXAGE
+    def isCurrent(self, oid, serial):
+        return serial == self._cur[oid]
 
-    def lastTransaction(self):
-        """ Return tid for last committed transaction (for ZEO)
-        """
-        return self._ltid
+    def hook(self, oid, tid, version):
+        # A hook for testing
+        pass
 
     def __len__(self):
         return len(self._index)
 
-    def getSize(self):
-        return 0
-
     def _clear_temp(self):
-        now = time.time()
-        if now > (self._last_cache_gc + self._conflict_cache_gcevery):
-            temp_cc = self._conflict_cache.copy()
-            for k, v in temp_cc.items():
-                data, t = v
-                if now > (t + self._conflict_cache_maxage):
-                    del self._conflict_cache[k]
-            self._last_cache_gc = now
-        self._tmp = []
-
-    def close(self):
-        """ Close the storage
-        """
+        pass
 
     def load(self, oid, version=''):
+        assert version == ''
         with self._lock:
-            try:
-                s = self._index[oid]
-                p = self._opickle[oid]
-                return p, s  # pickle, serial
-            except KeyError:
-                # this oid was probably garbage collected while a thread held
-                # on to an object that had a reference to it; we can probably
-                # force the loader to sync their connection by raising a
-                # ConflictError (at least if Zope is the loader, because it
-                # will resync its connection on a retry).  This isn't
-                # perfect because the length of the recently gc'ed oids list
-                # is finite and could be overrun through a mass gc, but it
-                # should be adequate in common-case usage.
-                if oid in self._recently_gc_oids:
-                    raise POSException.ConflictError(oid=oid)
-                else:
-                    raise
+            assert not version
+            tid = self._cur[oid]
+            self.hook(oid, tid, '')
+            return self._index[(oid, tid)], tid
 
-    # Apparently loadEx is required to use this as a ZEO storage for
-    # ZODB 3.3.  The tests don't make it totally clear what it's meant
-    # to do.  There is a comment in FileStorage about its loadEx
-    # method implementation that says "a variant of load that also
-    # returns a transaction id.  ZEO wants this for managing its
-    # cache".  But 'load' appears to do that too, so uh, who knows.
-    # - CM
+    def _begin(self, tid, u, d, e):
+        self._txn = Transaction(tid)
 
-    def loadEx(self, oid, version=''):
-        data = self.load(oid)
-        # pickle, serial, version
-        return (data[0], data[1], "")
+    def store(self, oid, serial, data, v, txn):
+        if txn is not self._transaction:
+            raise POSException.StorageTransactionError(self, txn)
+        assert not v
+        if self._cur.get(oid) != serial:
+            if not (serial is None or self._cur.get(oid) in [None, z64]):
+                raise POSException.ConflictError(
+                    oid=oid, serials=(self._cur.get(oid), serial), data=data)
+        self._txn.store(oid, data)
+        return self._tid
 
-    def loadSerial(self, oid, serial, marker=[]):
-        """ This is only useful to make conflict resolution work.
+    def _abort(self):
+        del self._txn
 
-        It does not actually implement all the semantics that a revisioning
-        storage needs!
-        """
+    def _finish(self, tid, u, d, e):
         with self._lock:
-            data = self._conflict_cache.get((oid, serial), marker)
-            if data is marker:
-                # XXX Need 2 serialnos to pass them to ConflictError--
-                # the old and the new
-                raise POSException.ConflictError(oid=oid)
-            else:
-                return data[0]  # data here is actually (data, t)
+            self._index.update(self._txn.index)
+            self._cur.update(self._txn.cur())
+            self._ltid = self._tid
 
-    def loadBefore(self, oid, tid):
-        """ Return most recent revision of oid before tid committed.
-
-        Needed for MVCC.
-        """
-        # implementation stolen from ZODB.test_storage.MinimalMemoryStorage
+    def loadBefore(self, the_oid, the_tid):
+        # It's okay if loadBefore() is really expensive, because this
+        # storage is just used for testing.
         with self._lock:
-            tids = [stid for soid, stid in self._conflict_cache if soid == oid]
+            tids = [tid for oid, tid in self._index if oid == the_oid]
             if not tids:
-                raise POSException.POSKeyError(oid)
+                raise KeyError(the_oid)
             tids.sort()
-            i = bisect.bisect_left(tids, tid) - 1
+            i = bisect.bisect_left(tids, the_tid) - 1
             if i == -1:
                 return None
-            start_tid = tids[i]
+            tid = tids[i]
             j = i + 1
             if j == len(tids):
                 end_tid = None
             else:
                 end_tid = tids[j]
-            data = self.loadSerial(oid, start_tid)
-            return data, start_tid, end_tid
 
-    def store(self, oid, serial, data, version, transaction):
-        if transaction is not self._transaction:
-            raise POSException.StorageTransactionError(self, transaction)
-        assert not version
+            self.hook(the_oid, self._cur[the_oid], '')
 
-        with self._lock:
-            if oid in self._index:
-                oserial = self._index[oid]
-                if serial != oserial:
-                    newdata = self.tryToResolveConflict(
-                        oid, oserial, serial, data)
-                    if not newdata:
-                        raise POSException.ConflictError(
-                            oid=oid,
-                            serials=(oserial, serial),
-                            data=data)
-                    else:
-                        data = newdata
-            else:
-                oserial = serial
-            self._tmp.append((oid, data))
+            return self._index[(the_oid, tid)], tid, end_tid
 
-    def _finish(self, tid, u, d, e):
-        zeros = {}
-        referenceCount = self._referenceCount
-        referenceCount_get = referenceCount.get
-        oreferences = self._oreferences
-        serial = self._tid
-        index = self._index
-        opickle = self._opickle
-        self._ltid = tid
+    def loadSerial(self, oid, serial):
+        return self._index[(oid, serial)]
 
-        # iterate over all the objects touched by/created within this
-        # transaction
-        for entry in self._tmp:
-            oid, data = entry[:]
-            referencesl = []
-            referencesf(data, referencesl)
-            references = {}
-            for roid in referencesl:
-                references[roid] = 1
+    def close(self):
+        pass
 
-            # Create a reference count for this object if one
-            # doesn't already exist
-            if referenceCount_get(oid) is None:
-                referenceCount[oid] = 0
-
-            # update references that are already associated with this
-            # object
-            roids = oreferences.get(oid, [])
-            for roid in roids:
-                if roid in references:
-                    # still referenced, so no need to update
-                    # remove it from the references dict so it doesn't
-                    # get "added" in the next clause
-                    del references[roid]
-                else:
-                    # Delete the stored ref, since we no longer
-                    # have it
-                    oreferences[oid].remove(roid)
-                    # decrement refcnt:
-                    rc = referenceCount_get(roid, 1)
-                    rc = rc - 1
-                    if rc < 0:
-                        # This should never happen
-                        raise ReferenceCountError(
-                            "%s (Oid %r had refcount %s)" %
-                            (ReferenceCountError.__doc__, roid, rc))
-                    referenceCount[roid] = rc
-                    if rc == 0:
-                        zeros[roid] = 1
-
-            # Create a reference list for this object if one
-            # doesn't already exist
-            if oreferences.get(oid) is None:
-                oreferences[oid] = []
-
-            # Now add any references that weren't already stored
-            for roid in references.keys():
-                oreferences[oid].append(roid)
-                # Create/update refcnt
-                rc = referenceCount_get(roid, 0)
-                if rc == 0 and zeros.get(roid) is not None:
-                    del zeros[roid]
-                referenceCount[roid] = rc + 1
-
-            index[oid] = serial
-            opickle[oid] = data
-            now = time.time()
-            self._conflict_cache[(oid, serial)] = data, now
-
-        if zeros:
-            for oid in zeros.keys():
-                if oid == '\0\0\0\0\0\0\0\0':
-                    continue
-                self._takeOutGarbage(oid)
-
-        self._tmp = []
-
-    def _takeOutGarbage(self, oid):
-        # take out the garbage.
-        referenceCount = self._referenceCount
-        referenceCount_get = referenceCount.get
-
-        self._recently_gc_oids.pop()
-        self._recently_gc_oids.insert(0, oid)
-
-        try:
-            del referenceCount[oid]
-        except Exception:
-            pass
-
-        try:
-            del self._opickle[oid]
-        except Exception:
-            pass
-
-        try:
-            del self._index[oid]
-        except Exception:
-            pass
-
-        # remove this object from the conflict cache if it exists there
-        for k in list(self._conflict_cache.keys()):
-            if k[0] == oid:
-                del self._conflict_cache[k]
-
-        # Remove/decref references
-        roids = self._oreferences.get(oid, [])
-        while roids:
-            roid = roids.pop(0)
-            # decrement refcnt:
-            # DM 2005-01-07: decrement *before* you make the test!
-            # rc=referenceCount_get(roid, 0)
-            rc = referenceCount_get(roid, 0) - 1
-            if rc == 0:
-                self._takeOutGarbage(roid)
-            elif rc < 0:
-                raise ReferenceCountError(
-                    "%s (Oid %r had refcount %s)" %
-                    (ReferenceCountError.__doc__, roid, rc))
-            else:
-                # DM 2005-01-07: decremented *before* the test! see above
-                referenceCount[roid] = rc
-        try:
-            del self._oreferences[oid]
-        except Exception:
-            pass
-
-    def pack(self, t, referencesf):
-        with self._lock:
-            rindex = {}
-            rootl = ['\0\0\0\0\0\0\0\0']
-
-            # mark referenced objects
-            while rootl:
-                oid = rootl.pop()
-                if oid in rindex:
-                    continue
-                p = self._opickle[oid]
-                referencesf(p, rootl)
-                rindex[oid] = None
-
-            # sweep unreferenced objects
-            for oid in self._index.keys():
-                if oid not in rindex:
-                    self._takeOutGarbage(oid)
+    cleanup = close
